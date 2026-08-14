@@ -1,0 +1,837 @@
+================================================================================
+UNIVERSAL GLB CONFIGURATOR — TECHNICAL MANUAL
+Revision 1 · Project schema version 1
+================================================================================
+
+A browser-only editor that opens any binary glTF, works out what its parts
+mechanically DO, generates working controls for them, and bakes the result back
+into a GLB that behaves the same in any viewer. No server, no upload, no
+per-model code.
+
+Stack .......... React 19 · TypeScript 5.8 · three.js 0.185 · Vite 6
+Source ......... ~7,000 lines
+Tests .......... 11 Vitest suites
+Network ........ none
+
+
+CONTENTS
+--------------------------------------------------------------------------------
+  01  What it is
+  02  Quick start
+  03  Concepts
+  04  Architecture
+  05  Import pipeline
+  06  Detection
+  07  Interactions
+  08  Pivots
+  09  Materials
+  10  Interface
+  11  Undo
+  12  Project files
+  13  Export
+  14  Testing and debugging
+  15  Extending it
+  16  Known limits
+
+
+================================================================================
+01  WHAT IT IS
+================================================================================
+
+Give a normal 3D viewer a GLB of a server rack and it shows you a server rack.
+Give this app the same file and it tells you which panel is a door, which disc is
+a fan, which tray slides out — then puts an Open/Close button, a speed slider and
+an extension scrubber on screen for them. Nothing about the app knows what a
+server rack is. It reasons from geometry, hierarchy, naming and baked animation.
+
+Four things it does, in order of how much work they save:
+
+  DETECT
+    Classifies every node as door, fan, drawer, rotating part, switch,
+    generically animated, or unknown — with a confidence score and a list of
+    reasons you can read.
+
+  CONFIGURE
+    Generates controls for detected parts, and lets you author your own from
+    nine presets when detection guesses wrong or the model has no animation at
+    all.
+
+  CORRECT
+    Fixes the classic broken-GLB problems: a door hinged at its centre, a door
+    that swings the wrong way, a fan spinning on the wrong axis — without
+    touching vertex data.
+
+  SHIP
+    Bakes everything you configured into real animation clips and writes a new
+    GLB that works in Blender, <model-viewer>, or any three.js scene with no
+    editor attached.
+
+  ! EVERYTHING IS LOCAL
+    The GLB is read with File.arrayBuffer() and parsed in the tab. Saved
+    configurations go to IndexedDB on the same machine. There is no backend and
+    no fetch to anywhere — a fact worth knowing if the models are confidential.
+
+
+================================================================================
+02  QUICK START
+================================================================================
+
+RUN IT
+
+    npm install
+    npm run dev        # Vite dev server
+    npm run build      # tsc -b && vite build
+    npm run preview    # serve the production build
+    npm run lint       # eslint
+    npm test           # vitest run
+    npm run test:watch
+
+USE IT
+
+  1. Drag a .glb onto the viewport, or click "Open GLB" in the toolbar.
+  2. Open the Configurator tab at the bottom. Detected parts already have
+     controls.
+  3. Anything mis-detected: select the node in the Outliner, use "Add
+     Interaction" in the Inspector, pick a preset.
+  4. Wrong hinge point? Set a pivot mode, or drag the pivot marker with the
+     gizmo.
+  5. Work is autosaved to IndexedDB, keyed by the model's content hash. Reopen
+     the same GLB and it comes straight back.
+  6. "Export GLB" bakes the configuration into clips and downloads a new file.
+
+REQUIREMENTS
+
+  Any WebGL2 browser. IndexedDB is needed for autosave — in private modes where
+  it is unavailable, the editor still works and saving degrades silently to a
+  no-op. Import ceiling is 1 GB per file.
+
+
+================================================================================
+03  CONCEPTS
+================================================================================
+
+Seven terms carry the whole design. Everything else in the codebase is plumbing
+between them.
+
+  MANIFEST                                              scanner/types.ts
+    Fully serializable description of the loaded GLB: every node with
+    transforms, world bounds, geometry stats, material ids. React renders from
+    this and never walks the three.js graph.
+
+  STABLE ID                                             NodeEntry.stableId
+    Child-index path from the scene root, e.g. "2/0/1". Runtime ids are
+    Object3D.uuid, which three.js regenerates on every parse — so anything
+    written to disk is keyed by the path instead. Names are never keys; glTF
+    names are not unique.
+
+  CAPABILITY MANIFEST                                   capability/
+    Structure + material facts + animation facts + semantic verdict, merged into
+    one derived object. The single thing the UI queries.
+
+  SEMANTIC                                              semantic/
+    What a part is, mechanically: door, fan, drawer, rotating, switch, animated,
+    unknown, plus a 0–1 confidence.
+
+  INTERACTION                                           interaction/
+    A pure-JSON definition of a behaviour — no functions, no Object3D
+    references. The engine turns it into motion at runtime; the project file
+    stores it untouched.
+
+  DRIVER                                                PivotService
+    The object an interaction actually moves. Equal to the target when the pivot
+    is "original"; otherwise a proxy group inserted at the hinge point.
+
+  PROJECT                                               project/schema.ts
+    Zod-validated JSON holding ONLY the diff from the imported model —
+    overrides, interactions, camera, editor settings. The GLB binary is never
+    embedded.
+
+
+================================================================================
+04  ARCHITECTURE
+================================================================================
+
+Three layers with a one-way dependency. The engine is plain three.js and knows
+nothing about React; React knows nothing about three.js. The bridge is a single
+provider.
+
+  +--------------------------------------------------------------------------+
+  | UI      src/ui — Toolbar, Outliner, Viewport3D, Inspector, BottomPanel,   |
+  |         ConfiguratorPanel, InteractionEditor, AnimationsPanel,            |
+  |         MaterialControls, RotationPanel                                   |
+  +--------------------------------------------------------------------------+
+            reads state |                     | calls EngineApi
+                        v                     v
+  +--------------------------------------------------------------------------+
+  | STATE   src/state — Zustand store (editorStore), EngineProvider,          |
+  |         EngineApi interface                                              |
+  +--------------------------------------------------------------------------+
+            owns engine |                     ^ pushes manifests + events up
+                        v                     |
+  +--------------------------------------------------------------------------+
+  | ENGINE  src/engine — EditorEngine facade over Viewport, ModelManager,     |
+  |         SelectionManager, TransformManager, MaterialService,              |
+  |         AnimationManager, InteractionEngine, CommandHistory               |
+  +--------------------------------------------------------------------------+
+            three.js scene graph — single source of truth for geometry
+                        v
+  +--------------------------------------------------------------------------+
+  | I/O     src/glb loader / exporter / baker                                 |
+  |         src/project schema, diffing, Dexie storage                        |
+  +--------------------------------------------------------------------------+
+
+THE RULE THAT MAKES IT WORK
+
+  React state holds descriptions, not objects. The scene graph holds objects,
+  not descriptions. Any time the engine mutates the scene it emits plain data —
+  NodeEntry[], MaterialEntry[], InteractionDefinition[] — that the store merges.
+  This is why selection made by clicking in the viewport lights up the Outliner,
+  and why dragging the gizmo updates numbers in the Inspector, without either
+  component ever touching an Object3D.
+
+WIRING, BOTH DIRECTIONS
+
+  engine -> store   selection.onChange
+                    Store selection updates; ancestors of the primary node
+                    auto-expand in the Outliner.
+
+  engine -> store   transforms.onObjectChange
+                    Live transform values stream into the Inspector during a
+                    gizmo drag; highlights refresh.
+
+  engine -> store   transforms.onDraggingChanged
+                    Snapshot on grab, one undo command on release — a drag is
+                    one history entry, not hundreds.
+
+  engine -> store   interactions.onChange, history.onChange
+                    Definition list and undo/redo button state.
+
+  store -> engine   useEditorStore.subscribe
+                    Gizmo mode, space, enabled flag, snap increments — pure UI
+                    state pushed down.
+
+MODULE MAP
+
+  engine/EditorEngine.ts
+    Facade. Model swap, selection routing, baseline capture, override diffing,
+    id maps, pivot-edit mode, export orchestration, debug snapshots.
+
+  engine/Viewport.ts
+    Renderer, scene, camera, OrbitControls, lights, grid, ResizeObserver, render
+    loop, post-processing chain.
+
+  engine/scanner/ModelScanner.ts
+    Walks gltf.scene -> manifest + live lookup maps. Model-agnostic; knows
+    nothing about doors or fans.
+
+  engine/animation/AnimationScanner.ts
+    Resolves every track to a real object via PropertyBinding, measures rotation
+    sweep, translation distance, axis, cyclicity.
+
+  engine/semantic/SemanticDetector.ts
+    Weighted-evidence classifier. Deterministic, explainable, no ML.
+
+  engine/capability/CapabilityManifest.ts
+    Merges all of the above and decides which parts earn a Configurator card.
+
+  engine/interaction/InteractionEngine.ts
+    Runs JSON definitions against the scene; per-frame easing, looping, spin
+    integration.
+
+  engine/interaction/PivotService.ts
+    Proxy-group re-parenting so hinge points can move without editing geometry.
+
+  engine/MaterialService.ts
+    Live material registry, user counting, shared-vs-isolated edits, orphan
+    disposal.
+
+  glb/bakeAnimations.ts
+    Samples eased interaction motion into AnimationClip keyframe tracks.
+
+  project/projectIO.ts
+    uuid <-> stable-id translation, save snapshotting, restore with warnings.
+
+
+================================================================================
+05  IMPORT PIPELINE
+================================================================================
+
+One drop of a file runs six stages. Each produces plain data consumed by the
+next.
+
+  1 · VALIDATE                                              GLBLoader.ts
+      Extension, non-zero size, 1 GB ceiling, "glTF" magic bytes at offset 0.
+      Every failure path throws a GLBLoadError with a message written for a
+      human.
+
+  2 · PARSE & HASH                              GLBLoader · schema.hashBytes
+      GLTFLoader with the meshopt decoder. FNV-1a over the raw bytes gives the
+      model identity used for autosave lookup.
+
+  3 · SCAN STRUCTURE                                        ModelScanner
+      Depth-first walk -> NodeEntry per object with stable id, world bounds,
+      world origin, geometry stats, morph targets, material slots.
+
+  4 · SCAN MOTION                                           AnimationScanner
+      Every track resolved to its real object, then measured: total rotation
+      degrees, dominant axis, translation distance, returns-to-start, cyclic.
+
+  5 · CLASSIFY                        SemanticDetector · CapabilityManifest
+      Weighted evidence per node -> semantic type, confidence, reason list.
+      Then merged into the capability manifest with generated interaction
+      affordances.
+
+  6 · BASELINE & FRAME                                      EditorEngine
+      Pristine transform/material state snapshotted for later diffing. Camera
+      framed to bounds; ground grid rescaled so a 3 cm part and a 30 m building
+      both read correctly.
+
+After stage 6 the store is populated and, if a project was previously saved under
+this hash, it is restored automatically. A load token guards the whole sequence:
+if you drop a second file while a large first one is still parsing, the stale
+result is discarded rather than shown.
+
+  ! BASELINE
+    Right after import the engine records every node's name, visibility,
+    position, quaternion, scale and material assignment. Saving later diffs
+    against this snapshot, which is why a project file for an untouched model is
+    essentially empty.
+
+
+================================================================================
+06  DETECTION
+================================================================================
+
+The classifier is deterministic and auditable. Each rule contributes a weighted
+vote to one semantic type and records a sentence explaining itself; those
+sentences surface in the UI, so a detection can always be questioned.
+
+EVIDENCE AND WEIGHTS
+
+  SOURCE      RULE                                       WEIGHT   VOTES FOR
+  ---------------------------------------------------------------------------
+  Name        Own name token matches the type vocabulary  +0.30   that type
+  Hierarchy   An ancestor's name matches                  +0.12   that type
+  Hierarchy   A descendant named like a part of one —
+              handle, hinge, blade, runner                +0.12   door/fan/
+                                                                  drawer/switch
+  Name        An animation clip driving it mentions
+              the type                                    +0.08   that type
+  Shape       Slab proportions — thinnest axis under
+              25% of longest                              +0.10   door
+  Shape       Disc proportions — two axes near-equal,
+              third under half                            +0.10   fan
+  Shape       Diagonal under 5% of the whole model's
+              diagonal                                    +0.12   switch
+  Animation   Cyclic rotation >= 300 deg                  +0.45   rotating
+  Animation   Cyclic rotation >= 300 deg                  +0.40   fan
+  Animation   Cyclic rotation >= 300 deg                  -0.30   door (AGAINST)
+  Animation   Rotation sweep between 15 and 200 deg       +0.35   door
+  Animation   ...about the vertical axis                  +0.08   door
+  Animation   ...with the origin over 25% off its
+              bounding-box centre                         +0.15   door
+  Animation   Rotation sweep under 15 deg                 +0.25   switch
+  Animation   Slides more than 15% of its own extent
+              along one axis                              +0.40   drawer
+  Animation   ...horizontally (x or z)                    +0.08   drawer
+  Animation   Short push travel                           +0.20   switch
+
+THE TWO GUARDRAILS
+
+  Naming alone is the weakest evidence there is — plenty of exported meshes are
+  called Cube.003, and plenty of things called "panel" are welded shut. So:
+
+  * NAME-ONLY CONFIDENCE IS CAPPED AT 0.35. Without at least one
+    animation-sourced vote, no guess can be presented as confident.
+
+  * AMBIGUOUS TYPES NEED NAMING OR HIERARCHY SUPPORT. door, fan, drawer and
+    switch are only eligible if a name or hierarchy rule also fired — a 45 deg
+    swing on its own could be a door, a lever or a hinge bracket. "rotating" is
+    deliberately exempt: a full revolution is mechanically unambiguous.
+
+THRESHOLDS
+
+  CONSTANT                     VALUE     MEANING
+  ---------------------------------------------------------------------------
+  NAME_ONLY_CAP                0.35      Ceiling without animation backing.
+  TYPE_THRESHOLD               0.40      Score a type must clear to beat
+                                         animated/unknown.
+  CONFIGURATOR_CONFIDENCE      0.30      Minimum to earn a Configurator card.
+                                         Keeps screws off the panel.
+  SPIN_DEG                     300 deg   Sweep above which motion counts as a
+                                         spin, not a swing.
+  SWING_MIN / SWING_MAX     15 / 200 deg Hinged-swing window.
+  ROTATION_EPSILON_DEG         0.5 deg   Below this, rotation is noise.
+
+A part that is animated but matches no pattern lands on "animated" with
+confidence 0.5 — honest about being driven by something without pretending to
+know what. A part with no animation and no matching evidence gets "unknown" at 0.
+
+OVERRIDING A VERDICT
+
+  Accepting a suggestion creates a real interaction from the matching preset and
+  records {type, status: 'accepted'}. Ignoring records status: 'ignored' and
+  removes the card. Both are undoable and both are saved with the project — the
+  classifier's opinion never overwrites yours on reload.
+
+
+================================================================================
+07  INTERACTIONS
+================================================================================
+
+An InteractionDefinition is JSON: an id, a name, a preset, a semantic, a target
+(plus extra targets that move as one part — glass, frame, handle), a pivot spec,
+on/off labels, and a config union. The runtime holds a normalized value from 0
+(closed, off, rest) to 1 (open, on).
+
+CONFIG KINDS
+
+  rotateBetween
+    axis, closedDeg, openDeg, durationMs, easing, loop
+    Eases the driver's rotation between two angles about one axis.
+
+  translateBetween
+    axis, closed, open, durationMs, easing, loop
+    Slides along one axis, offsets in model units relative to the rest pose.
+
+  continuousSpin
+    axis, speedDegPerSec, maxSpeedDegPerSec, direction, running
+    Integrates an angle every frame. Speed and direction are live controls.
+
+  playAnimation
+    clipIds, mode, loop, speed
+    Binds the control to clips already baked into the GLB, through the mixer.
+
+  toggleVisibility
+    hiddenByDefault
+    Shows/hides the target set. No motion.
+
+  transform
+    from/to (position, rotationDeg, scale), durationMs, easing, loop
+    Interpolates full TRS between two saved states — the catch-all.
+
+PRESETS AND THEIR DEFAULTS
+
+  PRESET               PRODUCES            DEFAULTS                     PIVOT
+  ---------------------------------------------------------------------------
+  Door                 rotateBetween       0 -> 105 deg, 900 ms,        left
+                                           easeInOut
+  Fan / Spin           continuousSpin      360 deg/s, max 1800 deg/s,   center
+                                           axis z
+  Drawer / Slider      translateBetween    travel = 80% of the extent   original
+                                           on that axis, 700 ms,
+                                           easeOut
+  Button / Switch      translateBetween    short inward push, 120 ms,   original
+                                           easeOut
+  Lever                rotateBetween       0 -> 35 deg, 250 ms,         bottom
+                                           easeOut
+  Generic Rotation     rotateBetween       0 -> 90 deg, 1000 ms,        original
+                                           linear
+  Generic Translation  translateBetween    travel = 80% of extent,      original
+                                           1000 ms, linear
+  Existing Animation   playAnimation       toggle mode, looping, 1x     —
+  Show / Hide          toggleVisibility    visible by default           —
+
+FRAME LOOP
+
+  tick(delta) advances every interaction. Non-looping motion steps "value"
+  toward "target" at delta / duration. Looping motion runs on its own;
+  "pingpong" bounces at each end. Spins integrate speed x direction x delta.
+  The result is always written RELATIVE TO THE REST POSE captured when the
+  interaction was bound, so repeated edits never accumulate drift.
+
+  Easing curves available: linear, easeIn, easeOut, easeInOut.
+
+OVERRIDING BAKED ANIMATION
+
+  A definition may carry overrideClipIds. Those clips are stopped and parked at
+  their rest frame while the interaction exists, and dropped entirely from the
+  export. This is the fix for a GLB whose door was animated swinging into the
+  wall: "Override animation" in the Inspector reads what the scanner measured —
+  axis, sweep, direction — seeds an editable rotateBetween from it, and silences
+  the original clip so the two never fight.
+
+CLIP PLAYBACK
+
+  Original clips are driven by AnimationManager, one AnimationAction per clip
+  with per-clip loop, speed and direction. It handles the edge cases that make
+  naive players jump: reversing from a clamped end pose rewinds the playhead
+  first; cyclic clips default to looping while one-shot motions like doors do
+  not; stop() issues a zero-delta mixer update so the rest pose is actually
+  written back to the scene graph.
+
+
+================================================================================
+08  PIVOTS
+================================================================================
+
+Most doors in exported GLBs rotate around their own centre because whoever
+modelled them never moved the origin. Fixing that normally means going back to
+the DCC tool. Here it is a runtime operation.
+
+PivotService inserts a proxy Group into the parent at the desired hinge point,
+then calls Object3D.attach() on the targets. attach() preserves world matrices,
+so NOTHING MOVES ON SCREEN — only the origin of future rotations changes. The
+proxy becomes the DRIVER: what interactions rotate, and what baked tracks target
+on export.
+
+  original         The object's own origin. No proxy is created unless multiple
+                   targets are grouped.
+  center           Centre of the combined world bounding box.
+  left / right     Bounding-box face on the +/-X extreme — a hinge on a panel
+                   edge.
+  top / bottom     Bounding-box face on the +/-Y extreme — lids and levers.
+  custom           An explicit world-space point, usually placed by dragging.
+
+VISUAL PIVOT EDITING
+
+  Entering pivot-edit mode drops an orange marker — sphere plus axes, both drawn
+  with depthTest: false so they stay visible inside solid geometry — at the
+  current pivot, and re-attaches the transform gizmo to IT. The model itself
+  never moves while you drag. The marker scales to 2% of the model radius, so it
+  stays usable at any model scale. Leaving the mode disposes the helper and
+  returns the gizmo to whatever was selected.
+
+
+================================================================================
+09  MATERIALS
+================================================================================
+
+MaterialService keeps a live registry of every material plus the set of objects
+using each one. Edits happen in one of two scopes:
+
+  SHARED    Writes straight to the material. Every object referencing it
+            changes. Correct when you are recolouring "the chassis paint".
+
+  ISOLATE   Clones the material first, so only the selected object changes.
+            Correct when you are recolouring "this one door".
+
+Clones share their textures BY REFERENCE, so tinting a textured material keeps
+its normal map, roughness map and everything else instead of flattening to a
+solid colour. Materials that end up with no users are tracked as orphans and
+disposed when the model unloads, which is what keeps repeated import -> edit ->
+import cycles from leaking GPU memory.
+
+Editable per material: colour, opacity, transparency flag, metalness, roughness,
+emissive colour, emissive intensity.
+
+
+================================================================================
+10  INTERFACE
+================================================================================
+
+LAYOUT
+
+  Toolbar across the top; Outliner, viewport and Inspector across the middle;
+  tabbed panel along the bottom.
+
+  TOOLBAR
+    Open/Replace GLB · Frame Model · Focus Selected · Reset View · Undo/Redo ·
+    gizmo mode and space · snap increments · grid toggle · save state and
+    autosave switch · project import/export · Export GLB.
+
+  OUTLINER
+    Full scene tree with search, ancestor auto-reveal, expand/collapse all,
+    visibility toggles. Ctrl/Cmd-click adds to the selection; Shift-click
+    extends over the depth-first order like a file tree.
+
+  VIEWPORT
+    Orbit/pan/zoom, drag-and-drop import, click-to-pick. Selection is drawn with
+    an OutlinePass, in amber, visible through geometry in a dimmer tone.
+
+  INSPECTOR
+    Rename, visibility, numeric transforms, per-slot material controls,
+    detection verdict with its reasons, Add Interaction, Override animation.
+
+  CONFIGURATOR
+    Generated controls grouped into Doors, Cooling, Drawers, Switches, Other.
+    Quick angles 45/60/90/105/120 deg and 180 deg, speeds 0.25/0.5/1/2x.
+
+  ANIMATIONS
+    Every original clip: play, pause, stop, loop, speed, direction, scrub, plus
+    the list of objects each clip drives.
+
+  MATERIALS · MODEL INFO · ROTATION
+    Material registry editor; import statistics; a focused list of every
+    rotation-type interaction.
+
+  ! PICKING VERSUS ORBITING
+    A pointer-up only counts as a click when the pointer barely moved since
+    pointer-down. Without that, every orbit drag ending over a mesh would change
+    the selection.
+
+KEYBOARD
+
+  W                       Move gizmo
+  E                       Rotate gizmo
+  R                       Scale gizmo
+  X                       World / local space
+  Q                       Gizmo on / off
+  F                       Focus selected
+  A                       Frame whole model
+  Esc                     Clear selection
+  Ctrl+Z                  Undo
+  Ctrl+Shift+Z  (Ctrl+Y)  Redo
+
+  Shortcuts are suppressed while a text field has focus. Undo/redo stay live
+  over sliders and colour swatches, but yield to the browser's own undo inside
+  real text entry.
+
+RENDERING
+
+  Dark viewport, ACES filmic tone mapping, sRGB output, soft shadow maps, device
+  pixel ratio capped at 2. Lighting is a procedural PMREM environment — a small
+  box room with three emissive panels, generated at runtime — plus a hemisphere
+  light and two directionals. No external HDR asset, so the app works fully
+  offline. The post chain is a 4x MSAA render target -> RenderPass ->
+  OutlinePass -> OutputPass, with tone mapping applied exactly once at the end.
+
+
+================================================================================
+11  UNDO
+================================================================================
+
+A classic command stack, 200 entries deep, holding execute/undo closure pairs
+with human-readable labels — the toolbar tooltip says "Undo Change pivot", not
+"Undo".
+
+What is recorded, and what deliberately is not:
+
+  YES   Gizmo drag (one entry per drag, skipped if the pose did not change)
+  YES   Add / edit / delete an interaction
+  YES   Accept or ignore a detection suggestion
+  YES   Change a pivot mode
+  NO    Opening a door, spinning a fan, scrubbing a drawer
+        — runtime state, not authored state
+  NO    Restoring a saved project
+        — it clears the stack and becomes the new starting point
+
+Commands hold closures, so they live only in memory. Project files store
+resulting state, never the commands themselves.
+
+
+================================================================================
+12  PROJECT FILES
+================================================================================
+
+A project is a diff against the imported GLB, validated by Zod on both write and
+read. The binary is never embedded — a project references its model by name,
+size and content hash.
+
+    {
+      "version": 1,
+      "savedAt": 1755100000000,
+      "model":    { "fileName", "fileSize", "hash", "objectCount", "clipCount" },
+      "objects":  { "<stableId>": { name?, visible?, position?, quaternion?,
+                                    scale?, materialSlots? } },
+      "materials":{ "<index:name>": { color?, opacity?, metalness?,
+                                      roughness?, emissive?, ... } },
+      "interactions": [ InteractionDefinition, ... ],
+      "semanticOverrides": { "<stableId>": { type, status, note? } },
+      "pivots":   { "<interactionId>": PivotSpec },
+      "groups":   [],
+      "editor":   { gridVisible, transformMode, transformSpace,
+                    snapTranslation, snapRotationDeg, materialScope },
+      "camera":   { position, target, fov, near, far }
+    }
+
+WHY STABLE IDS
+
+  three.js hands out fresh uuids on every parse, so a uuid written to disk is
+  meaningless the next time the same file is opened. Objects are therefore keyed
+  by their child-index path from the scene root; materials, which have no path,
+  by "index-in-scan-order:name". buildProject() translates uuid -> stable on
+  save and applyProject() translates back on load.
+
+RESTORE ORDER
+
+  1. Object overrides — renames, visibility, transforms.
+  2. Shared material edits, then per-object isolated clones, re-cloned from the
+     recorded source material so old clone uuids never need to survive.
+  3. Interactions last, because binding them may re-parent objects into pivot
+     proxies.
+
+  Anything that no longer exists produces a warning string rather than an
+  exception — "Interaction 'Front door' has no target in this model". A stale
+  project degrades; it never bricks the editor.
+
+STORAGE AND AUTOSAVE
+
+  Backend               IndexedDB via Dexie, database
+                        "universal-glb-configurator", store "projects", primary
+                        key &hash.
+
+  Granularity           One saved configuration per model hash. Reopening a
+                        known GLB restores it automatically on import.
+
+  Autosave              Debounced 900 ms after the last change to interactions,
+                        semantic overrides, manifest or editor settings.
+                        Toggleable; state shows idle / dirty / saving / saved /
+                        error.
+
+  Validation on read    A corrupt or out-of-version record is logged and ignored
+                        rather than loaded.
+
+  Portability           Export writes pretty-printed JSON for sharing. Import
+                        validates and flags a hash mismatch as a warning without
+                        blocking — you can deliberately apply a config to a
+                        re-exported model.
+
+  Hash                  FNV-1a over the GLB bytes: synchronous,
+                        dependency-free, available in tests and workers where
+                        crypto.subtle is not.
+
+
+================================================================================
+13  EXPORT
+================================================================================
+
+Export turns editor-only behaviour into standard glTF animation, so the result
+needs no runtime from this project.
+
+  1. Every interaction is reset to its rest pose, pivot editing exits, the gizmo
+     detaches — the exported file captures the model at rest, not mid-swing.
+
+  2. Each definition is sampled into keyframe tracks at 24 FPS, targeting the
+     DRIVER uuid so pivot proxies come along correctly. Eased motion is sampled;
+     linear motion needs only its endpoints.
+
+  3. Continuous spins are written as one full 360 deg revolution whose duration
+     follows the configured speed — loopable in any viewer.
+
+  4. Original clips replaced via overrideClipIds are dropped, so the file never
+     contains both the old motion and its replacement.
+
+  5. The remaining original clips and the newly baked ones are handed to
+     GLTFExporter in binary mode and downloaded.
+
+The result reports byte length, the final clip name list, and any warnings — for
+example "2 original clip(s) replaced by manual interactions", or a definition
+skipped because its target disappeared.
+
+  ! WHAT DOES NOT SURVIVE EXPORT
+    toggleVisibility interactions have no keyframe equivalent and are not baked
+    as motion. Runtime-only affordances — speed sliders, direction switches,
+    scrub positions — become the clips themselves; the controls around them live
+    in the editor and in the project file, not in the GLB.
+
+
+================================================================================
+14  TESTING AND DEBUGGING
+================================================================================
+
+Eleven Vitest suites cover the parts where a silent regression would be
+expensive: the scanners, the classifier, the capability manifest, the interaction
+engine, the pivot service, the material service, the animation manager and
+scanner, the command history, the baker, the project schema and round-trip, and
+the store.
+
+In development builds the engine exposes read-only introspection on window:
+
+  __engineDebug()
+    Camera pose and distance, whether the model fits the frustum, selection,
+    node/material/clip counts, animation and interaction states, history depth,
+    renderer render and memory info.
+
+  __capDebug()
+    Capability manifest keyed by object name — semantic, confidence, operable,
+    category, interaction kinds, reasons — plus clips and their targets.
+
+  __matDebug()
+    Object name -> hex colour of its first material slot.
+
+  __nodeDebug(name)
+    Local and world transform of one node, plus its parent.
+
+  __gizmoDebug()
+    Gizmo mode, space, attachment, and the screen coordinates of its origin —
+    enough to drive click-drag tests.
+
+  __interactionDebug()
+    Current interaction definitions, ready to paste into a project file.
+
+  __projectDebug()
+    Current model hash and whatever is stored in IndexedDB under it.
+
+No production behaviour depends on any of these; they are guarded by
+import.meta.env.DEV.
+
+
+================================================================================
+15  EXTENDING IT
+================================================================================
+
+ADD A SEMANTIC TYPE
+
+  1. Add the literal to SemanticType and to semanticTypeSchema in the project
+     schema.
+  2. Add its vocabulary to VOCAB, and any child-part words to CHILD_HINTS, in
+     SemanticDetector.ts.
+  3. Decide whether it belongs in NAME_SUPPORT_REQUIRED — include it unless its
+     motion pattern is unambiguous on its own.
+  4. Push animation evidence for it in addAnimationEvidence(). Weights above 0.4
+     should require animation backing.
+  5. Map it to a Configurator category in categoryFor() and give it affordances
+     in buildInteractions().
+
+ADD AN INTERACTION PRESET
+
+  1. Add the id to InteractionPreset, the schema enum, and the PRESETS list with
+     a label and one-line description.
+  2. Return sensible defaults from createInteractionFromPreset() — including a
+     pivot mode, since that is what makes a preset feel right immediately.
+  3. If it introduces a new config kind, handle it in InteractionEngine.apply(),
+     in tick() if it animates itself, and in buildBakedClips() so it survives
+     export.
+
+ENABLE DRACO OR KTX2
+
+  Both are detected and reported today but not decoded. Attach the decoders in
+  GLBLoader.getLoader() alongside the existing meshopt decoder, and ship the
+  decoder files as static assets.
+
+REUSE THE ENGINE ELSEWHERE
+
+  InteractionEngine depends on nothing but an id -> Object3D resolver and an
+  optional animation bridge. Given those, saved interaction definitions can be
+  replayed in any three.js scene — a product page, a kiosk build — without
+  importing the editor at all.
+
+
+================================================================================
+16  KNOWN LIMITS
+================================================================================
+
+  Draco-compressed GLB          NOT DECODED
+    Detected on parse failure and reported clearly; decoder is simply not
+    attached.
+
+  KTX2 / Basis textures         NOT DECODED
+    Same shape of fix.
+
+  Input formats                 .GLB ONLY
+    Separate .gltf + .bin pairs are rejected by the extension check.
+
+  Logical groups                RESERVED
+    Present in the schema, always written empty. Multi-object behaviour today
+    uses extraTargetIds.
+
+  Visibility toggles in export  EDITOR ONLY
+    No keyframe equivalent; see section 13.
+
+  Concurrent models             ONE AT A TIME
+    Importing replaces; the previous model is fully disposed.
+
+  Per-node world bounds         ON BY DEFAULT
+    A Box3 per node. computeWorldBounds: false exists as an escape hatch for
+    very large scenes.
+
+  README                        STOCK TEMPLATE
+    Still the default Vite React-TS readme; this manual is the real
+    documentation.
+
+
+================================================================================
+Universal GLB Configurator · Project schema version 1
+Manual generated from source.
+================================================================================

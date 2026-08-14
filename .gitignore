@@ -1,0 +1,63 @@
+# Dependencies
+node_modules
+.pnp
+.pnp.*
+
+# Build output
+dist
+dist-ssr
+build
+*.tsbuildinfo
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Caches
+.vite
+.cache
+.eslintcache
+coverage
+.vitest
+
+# Environment
+.env
+.env.*
+!.env.example
+*.local
+
+# Local test assets and model-generation scratch
+chiller/
+*.glb
+*.gltf
+!public/**/*.glb
+!public/**/*.gltf
+
+# Exported configurations
+*.glbconfig.json
+
+# Python scratch (asset generators)
+__pycache__/
+*.py[cod]
+.venv
+venv/
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+Thumbs.db
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Agent tooling
+.claude/settings.local.json
